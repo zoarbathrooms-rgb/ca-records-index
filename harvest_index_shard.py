@@ -26,8 +26,8 @@ import lead_class as lc
 # so la_county_index parses it as parse_no_row and does NOT retry. We detect
 # that here and re-issue with backoff. Keep a small inter-call floor so a single
 # worker rides the ~0.3 req/s refill instead of blowing the ~20 burst instantly.
-idx.THROTTLE = (0.30, 0.55)   # ~2 req/s aggregate floor before concurrency
-idx.RETRIES = 4
+idx.THROTTLE = (0.55, 0.85)   # per-worker floor; ride the ~0.3/s refill, light on burst
+idx.RETRIES = 3
 
 THROTTLE_MARKERS = ("too many searches", "please wait a moment")
 
@@ -38,17 +38,22 @@ def _is_throttled(res):
     return any(m in rsn or m in ct for m in THROTTLE_MARKERS)
 
 
-def fetch_resilient(doc, max_wall_retries=9):
+def fetch_resilient(doc, max_wall_retries=4, max_wall_budget=18.0):
     """idx.fetch + detection of the soft 'Too many searches' rate-wall (HTTP 200
-    body). On a wall, exponential backoff with jitter and retry."""
+    body). SHALLOW backoff: cap total per-doc backoff so one persistently-walled
+    doc can't stall the whole shard (the 9-deep version did exactly that)."""
     import random
-    delay = 2.0
+    delay = 1.5
+    spent = 0.0
     for attempt in range(max_wall_retries):
         res = idx.fetch(str(doc), save_evidence=False)
         if res.get("ok") or not _is_throttled(res):
             return res
-        time.sleep(delay + random.uniform(0, delay))
-        delay = min(delay * 1.7, 20.0)
+        if spent >= max_wall_budget:
+            return res
+        s = min(delay + random.uniform(0, delay), max_wall_budget - spent)
+        time.sleep(max(s, 0.2)); spent += s
+        delay = min(delay * 1.6, 8.0)
     return res
 
 
@@ -114,7 +119,7 @@ def main():
     ap.add_argument("doc_start", type=int)
     ap.add_argument("doc_end", type=int)
     ap.add_argument("out_csv")
-    ap.add_argument("--conc", type=int, default=3)
+    ap.add_argument("--conc", type=int, default=2)
     a = ap.parse_args()
     harvest(a.doc_start, a.doc_end, a.out_csv, a.conc)
 
