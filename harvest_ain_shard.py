@@ -24,11 +24,15 @@ import sys, os, re, csv, json, time, random, threading, queue, argparse, collect
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import la_county_index as idx   # proven curl_cffi session + HTML parse helpers
 
-# Pace within the measured per-IP limiter (same posture as harvest_index_shard):
-# NETR's soft rate-wall is an HTTP 200 body "Too many searches. Please wait a
-# moment" (NOT a 429) -- detect by string, back off, retry. Small per-worker
-# floor so one worker rides the ~0.3 req/s refill instead of blowing the burst.
-idx.THROTTLE = (0.55, 0.85)
+# Pace to the MEASURED per-IP limiter: ~20 req/min (~0.33 req/s) refill, burst
+# ~20. The distribution multiplier is 20 IPs, NOT intra-IP concurrency -- a
+# 5-canary at conc=5 blew the burst and threw 38% "Too many searches" defers.
+# So default to ONE worker per shard, paced ~2.8-3.4s/req (~19/min/IP), which
+# the single-thread idx._throttle enforces cleanly (it shares _LAST_CALL and is
+# NOT thread-safe, so >1 worker under-paces). NETR's soft rate-wall is an HTTP
+# 200 body "Too many searches. Please wait a moment" (NOT a 429) -- string-match
+# + back off. With clean pacing, throttles are rare and recover in ~1.5s.
+idx.THROTTLE = (2.8, 3.4)
 idx.RETRIES = 3
 
 THROTTLE_MARKERS = ("too many searches", "please wait a moment")
@@ -88,7 +92,7 @@ def search_ain_page(session, ain, page=1):
     return {"count": total, "rows": _parse_rows(rh), "capped": "only the most recent" in cnt}
 
 
-def harvest_ain(session, ain, spacing=0.0, max_wall_budget=18.0):
+def harvest_ain(session, ain, spacing=0.0, max_wall_budget=30.0):
     """Full parcel history (paginated) with shallow soft-throttle backoff.
     Returns (rows, status) where status in done/throttled_defer/error/empty."""
     page = 1
@@ -104,7 +108,7 @@ def harvest_ain(session, ain, spacing=0.0, max_wall_budget=18.0):
             return rows, "error:%s" % type(e).__name__
         if res.get("throttled"):
             throttle_hits += 1
-            if spent >= max_wall_budget or throttle_hits > 4:
+            if spent >= max_wall_budget or throttle_hits > 6:
                 return rows, "throttled_defer"
             s = min(delay + random.uniform(0, delay), max_wall_budget - spent)
             time.sleep(max(s, 0.2)); spent += s
@@ -128,7 +132,7 @@ def main():
     ap.add_argument("start_line", type=int)   # inclusive, 0-based
     ap.add_argument("end_line", type=int)     # exclusive
     ap.add_argument("out_prefix")
-    ap.add_argument("--conc", type=int, default=5)
+    ap.add_argument("--conc", type=int, default=1)
     a = ap.parse_args()
 
     with open(a.ain_file, encoding="utf-8") as fh:

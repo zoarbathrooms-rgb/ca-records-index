@@ -14,7 +14,7 @@ on:
       wave_offset: { required: true,  type: string }                  # 0-based line offset into remaining_ains.txt
       wave_size:   { required: false, type: string, default: "132000" }
       shards:      { required: false, type: string, default: "20" }
-      conc:        { required: false, type: string, default: "5" }
+      conc:        { required: false, type: string, default: "1" }
 
 jobs:
   plan:
