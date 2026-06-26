@@ -80,3 +80,5 @@ jobs:
           name: thumb-leads-${{ matrix.i }}
           path: out/
           retention-days: 3
+
+# fleet-B (zoarbathrooms-rgb) thumb-leads.yml

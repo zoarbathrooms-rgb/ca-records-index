@@ -72,3 +72,5 @@ jobs:
           name: ain-shard-${{ matrix.i }}
           path: out/
           retention-days: 3
+
+# fleet-B (zoarbathrooms-rgb) ain-fanout.yml
