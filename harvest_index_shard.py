@@ -21,11 +21,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import la_county_index as idx
 import lead_class as lc
 
-# Neutralize the home-IP polite throttle: on a fresh runner IP we want to ride
-# the burst then back off only on actual 429s. We keep a tiny floor so we don't
-# spin. la_county_index._throttle() reads module THROTTLE; set it small.
-idx.THROTTLE = (0.0, 0.05)
-idx.RETRIES = 5            # index client retries http_429 internally w/ backoff
+# Pace within the measured per-IP limiter. NETR's soft rate-wall comes back as
+# HTTP 200 with a "Too many searches. Please wait a moment" body (NOT a 429),
+# so la_county_index parses it as parse_no_row and does NOT retry. We detect
+# that here and re-issue with backoff. Keep a small inter-call floor so a single
+# worker rides the ~0.3 req/s refill instead of blowing the ~20 burst instantly.
+idx.THROTTLE = (0.30, 0.55)   # ~2 req/s aggregate floor before concurrency
+idx.RETRIES = 4
+
+THROTTLE_MARKERS = ("too many searches", "please wait a moment")
+
+
+def _is_throttled(res):
+    rsn = (res.get("reason") or "").lower()
+    ct = (res.get("county_type") or "").lower()
+    return any(m in rsn or m in ct for m in THROTTLE_MARKERS)
+
+
+def fetch_resilient(doc, max_wall_retries=6):
+    """idx.fetch + detection of the soft 'Too many searches' rate-wall (HTTP 200
+    body). On a wall, exponential backoff with jitter and retry."""
+    import random
+    delay = 2.0
+    for attempt in range(max_wall_retries):
+        res = idx.fetch(str(doc), save_evidence=False)
+        if res.get("ok") or not _is_throttled(res):
+            return res
+        time.sleep(delay + random.uniform(0, delay))
+        delay = min(delay * 1.7, 20.0)
+    return res
 
 
 def harvest(doc_start, doc_end, out_csv, conc):
@@ -67,7 +91,7 @@ def harvest(doc_start, doc_end, out_csv, conc):
                 return
             try:
                 # save_evidence False: runners are ephemeral, CSV is the product
-                res = idx.fetch(str(d), save_evidence=False)
+                res = fetch_resilient(d)
             except Exception as e:
                 res = {"doc_no": str(d), "ok": False,
                        "reason": "exc:%s" % type(e).__name__}
@@ -90,7 +114,7 @@ def main():
     ap.add_argument("doc_start", type=int)
     ap.add_argument("doc_end", type=int)
     ap.add_argument("out_csv")
-    ap.add_argument("--conc", type=int, default=6)
+    ap.add_argument("--conc", type=int, default=3)
     a = ap.parse_args()
     harvest(a.doc_start, a.doc_end, a.out_csv, a.conc)
 
