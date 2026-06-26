@@ -1,0 +1,81 @@
+name: thumb-leads
+# Pull recorded-document PAGE IMAGES (PNG) for an explicit set of lead doc#s via
+# the deployed Cloudflare Worker, so OCR can extract APN + property address off
+# the NOD/AOD face. Egresses through Cloudflare IPs (not the home-IP budget).
+# doc_list = comma- or newline-separated doc#s (committed as docs_to_pull.txt, or
+# passed inline). Sharded across runners.
+on:
+  workflow_dispatch:
+    inputs:
+      pages:  { required: false, type: string, default: "3" }   # lead-sheet + body pages
+      shards: { required: false, type: string, default: "20" }
+      conc:   { required: false, type: string, default: "8" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          python3 - "$SHARDS" <<'PY' >> "$GITHUB_OUTPUT"
+          import sys, json, os
+          n=int(sys.argv[1])
+          docs=[d.strip() for d in open('docs_to_pull.txt').read().replace(',', '\n').split() if d.strip()]
+          per=-(-len(docs)//n) if docs else 1
+          sh=[{"i":i,"docs":",".join(docs[i*per:(i+1)*per])} for i in range(n) if i*per < len(docs)]
+          print("matrix="+json.dumps({"include":sh}))
+          PY
+        env:
+          SHARDS: ${{ inputs.shards }}
+
+  pull:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: pull pages
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+        run: |
+          echo "$NETR_PROXY_KEY" > /tmp/netr_proxy_key
+          mkdir -p out
+          python3 - "${{ matrix.docs }}" "${{ inputs.pages }}" "${{ inputs.conc }}" <<'PY'
+          import sys, os, urllib.request, ssl, threading, queue
+          docs=[d for d in sys.argv[1].split(",") if d]
+          pages=int(sys.argv[2]); conc=int(sys.argv[3])
+          KEY=open("/tmp/netr_proxy_key").read().strip()
+          W="https://netr-thumb.kaiescobar09.workers.dev"
+          CTX=ssl.create_default_context()
+          jobs=queue.Queue()
+          for d in docs:
+              for p in range(1,pages+1): jobs.put((d,p))
+          def work():
+              while True:
+                  try: d,p=jobs.get_nowait()
+                  except queue.Empty: return
+                  o="out/%s_%s.png"%(d,p)
+                  if not os.path.exists(o):
+                      try:
+                          req=urllib.request.Request("%s/thumb/%s/%s"%(W,d,p),headers={"X-Auth":KEY})
+                          with urllib.request.urlopen(req,timeout=45,context=CTX) as r:
+                              b=r.read()
+                              if b[:4]==b"\x89PNG" and len(b)>5000:
+                                  open(o,"wb").write(b)
+                      except Exception: pass
+                  jobs.task_done()
+          ts=[threading.Thread(target=work,daemon=True) for _ in range(conc)]
+          [t.start() for t in ts]; [t.join() for t in ts]
+          print("shard done: %d pngs"%len([f for f in os.listdir("out") if f.endswith('.png')]))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thumb-leads-${{ matrix.i }}
+          path: out/
+          retention-days: 3
