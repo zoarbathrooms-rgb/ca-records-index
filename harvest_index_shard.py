@@ -38,7 +38,7 @@ def _is_throttled(res):
     return any(m in rsn or m in ct for m in THROTTLE_MARKERS)
 
 
-def fetch_resilient(doc, max_wall_retries=6):
+def fetch_resilient(doc, max_wall_retries=9):
     """idx.fetch + detection of the soft 'Too many searches' rate-wall (HTTP 200
     body). On a wall, exponential backoff with jitter and retry."""
     import random
