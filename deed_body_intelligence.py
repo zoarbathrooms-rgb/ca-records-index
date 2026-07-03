@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+"""Extract buyer/seller intelligence signals from recorded-document page OCR.
+
+This is not a contact list builder. It converts public recorded-document page
+images into structured intelligence sidecars for later proof, trend, and buyer
+profile work. Raw OCR text is preserved beside the CSV so international mailing
+blocks and deed-body domicile clauses can be re-reviewed instead of being
+over-normalized into bad addresses.
+
+Usage:
+  python3 deed_body_intelligence.py <png_dir> <index_csv> <out_dir>
+
+Inputs:
+  png_dir   Directory containing NETR page PNGs named <doc_no>_<page>.png.
+  index_csv AIN docs CSV or doc_metadata.csv with doc_no plus index fields.
+  out_dir   Output directory for CSV, JSON summary, and raw OCR text files.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import Counter, defaultdict
+import csv
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Iterable
+
+try:
+    from PIL import Image, ImageOps
+except Exception:  # pragma: no cover - optional runtime dependency
+    Image = None
+    ImageOps = None
+
+
+ENTITY_TYPES = (
+    "CORPORATION",
+    "CORP",
+    "INCORPORATED",
+    "INC",
+    "LIMITED LIABILITY COMPANY",
+    "LIMITED PARTNERSHIP",
+    "GENERAL PARTNERSHIP",
+    "PARTNERSHIP",
+    "COMPANY",
+    "CO",
+    "LIMITED",
+    "LTD",
+    "LLC",
+    "LP",
+    "LLP",
+    "PLC",
+    "PTE LTD",
+    "SARL",
+    "S A",
+    "SA",
+    "GMBH",
+    "BV",
+    "NV",
+    "TRUST",
+)
+
+US_STATES = {
+    "ALABAMA", "ALASKA", "ARIZONA", "ARKANSAS", "CALIFORNIA", "COLORADO",
+    "CONNECTICUT", "DELAWARE", "FLORIDA", "GEORGIA", "HAWAII", "IDAHO",
+    "ILLINOIS", "INDIANA", "IOWA", "KANSAS", "KENTUCKY", "LOUISIANA",
+    "MAINE", "MARYLAND", "MASSACHUSETTS", "MICHIGAN", "MINNESOTA",
+    "MISSISSIPPI", "MISSOURI", "MONTANA", "NEBRASKA", "NEVADA",
+    "NEW HAMPSHIRE", "NEW JERSEY", "NEW MEXICO", "NEW YORK",
+    "NORTH CAROLINA", "NORTH DAKOTA", "OHIO", "OKLAHOMA", "OREGON",
+    "PENNSYLVANIA", "RHODE ISLAND", "SOUTH CAROLINA", "SOUTH DAKOTA",
+    "TENNESSEE", "TEXAS", "UTAH", "VERMONT", "VIRGINIA", "WASHINGTON",
+    "WEST VIRGINIA", "WISCONSIN", "WYOMING", "DISTRICT OF COLUMBIA",
+    "USA", "UNITED STATES", "UNITED STATES OF AMERICA",
+}
+
+JURISDICTION_ALIASES = [
+    (r"\bHONG\s+KONG(?:\s+SAR)?\b", "Hong Kong SAR", "asia"),
+    (r"\bJAPAN\b", "Japan", "asia"),
+    (r"\bCHINA\b|\bPRC\b|\bPEOPLE'?S\s+REPUBLIC\s+OF\s+CHINA\b", "China", "asia"),
+    (r"\bTAIWAN\b", "Taiwan", "asia"),
+    (r"\bSINGAPORE\b", "Singapore", "asia"),
+    (r"\bKOREA\b|\bSOUTH\s+KOREA\b", "South Korea", "asia"),
+    (r"\bINDIA\b", "India", "asia"),
+    (r"\bPHILIPPINES\b", "Philippines", "asia"),
+    (r"\bTHAILAND\b", "Thailand", "asia"),
+    (r"\bVIETNAM\b|\bVIET\s+NAM\b", "Vietnam", "asia"),
+    (r"\bMALAYSIA\b", "Malaysia", "asia"),
+    (r"\bINDONESIA\b", "Indonesia", "asia"),
+    (r"\bUNITED\s+KINGDOM\b|\bU\.?K\.?\b|\bENGLAND\b|\bWALES\b|\bSCOTLAND\b", "United Kingdom", "europe"),
+    (r"\bFRANCE\b|\bFRENCH\b", "France", "europe"),
+    (r"\bGERMANY\b|\bDEUTSCHLAND\b", "Germany", "europe"),
+    (r"\bNETHERLANDS\b|\bHOLLAND\b", "Netherlands", "europe"),
+    (r"\bBELGIUM\b", "Belgium", "europe"),
+    (r"\bPORTUGAL\b", "Portugal", "europe"),
+    (r"\bLUXEMBOURG\b", "Luxembourg", "europe"),
+    (r"\bSWITZERLAND\b", "Switzerland", "europe"),
+    (r"\bIRELAND\b", "Ireland", "europe"),
+    (r"\bITALY\b", "Italy", "europe"),
+    (r"\bSPAIN\b", "Spain", "europe"),
+    (r"\bMONACO\b", "Monaco", "europe"),
+    (r"\bCYPRUS\b", "Cyprus", "europe"),
+    (r"\bMALTA\b", "Malta", "europe"),
+    (r"\bDENMARK\b", "Denmark", "europe"),
+    (r"\bNORWAY\b", "Norway", "europe"),
+    (r"\bSWEDEN\b", "Sweden", "europe"),
+    (r"\bFINLAND\b", "Finland", "europe"),
+    (r"\bAUSTRIA\b", "Austria", "europe"),
+    (r"\bCZECH\s+REPUBLIC\b|\bCZECHIA\b", "Czechia", "europe"),
+    (r"\bUNITED\s+ARAB\s+EMIRATES\b|\bU\.?A\.?E\.?\b|\bDUBAI\b|\bABU\s+DHABI\b", "United Arab Emirates", "middle_east"),
+    (r"\bQATAR\b", "Qatar", "middle_east"),
+    (r"\bSAUDI\s+ARABIA\b", "Saudi Arabia", "middle_east"),
+    (r"\bKUWAIT\b", "Kuwait", "middle_east"),
+    (r"\bBAHRAIN\b", "Bahrain", "middle_east"),
+    (r"\bOMAN\b", "Oman", "middle_east"),
+    (r"\bTURKEY\b|\bTURKIYE\b", "Turkey", "middle_east"),
+    (r"\bISRAEL\b", "Israel", "middle_east"),
+    (r"\bLEBANON\b", "Lebanon", "middle_east"),
+    (r"\bJORDAN\b", "Jordan", "middle_east"),
+    (r"\bSOUTH\s+AFRICA\b", "South Africa", "africa"),
+    (r"\bCANADA\b", "Canada", "north_america"),
+    (r"\bMEXICO\b", "Mexico", "north_america"),
+    (r"\bBRAZIL\b", "Brazil", "south_america"),
+    (r"\bARGENTINA\b", "Argentina", "south_america"),
+    (r"\bCHILE\b", "Chile", "south_america"),
+    (r"\bBRITISH\s+VIRGIN\s+ISLANDS\b|\bBVI\b", "British Virgin Islands", "caribbean"),
+    (r"\bCAYMAN\s+ISLANDS\b", "Cayman Islands", "caribbean"),
+    (r"\bBERMUDA\b", "Bermuda", "caribbean"),
+    (r"\bAUSTRALIA\b", "Australia", "oceania"),
+    (r"\bNEW\s+ZEALAND\b", "New Zealand", "oceania"),
+]
+
+RESOURCE_PATTERNS = [
+    (r"\bPATENTED\s+(?:PLACER\s+)?(?:MINING\s+)?CLAIMS?\b", "PATENTED_PLACER_MINING_CLAIM"),
+    (r"\bPLACER\s+(?:MINING\s+)?CLAIMS?\b", "PLACER_MINING_CLAIM"),
+    (r"\bLODE\s+(?:MINING\s+)?CLAIMS?\b", "LODE_MINING_CLAIM"),
+    (r"\bMINERAL(?:S)?\b", "MINERAL"),
+    (r"\bMINING\b", "MINING"),
+    (r"\bPLACER\b", "PLACER"),
+    (r"\bHYDROCARBON(?:S)?\b", "HYDROCARBON"),
+    (r"\bOIL\s+(?:AND|&|/)\s+GAS\b|\bGAS\s+(?:AND|&|/)\s+OIL\b", "OIL_AND_GAS"),
+    (r"\bROYALT(?:Y|IES)\b", "ROYALTY"),
+    (r"\bWATER\s+RIGHTS?\b", "WATER_RIGHTS"),
+    (r"\bTIMBER\s+RIGHTS?\b|\bTIMBER\b", "TIMBER"),
+    (r"\bEASEMENT(?:S)?\b", "EASEMENT"),
+]
+
+APN_RE = re.compile(
+    r"\b(?:APN|AIN|A\.?P\.?N\.?|PARCEL\s+(?:NO|NUMBER)|ASSESSOR'?S?\s+PARCEL)\s*[:#]?\s*"
+    r"([0-9]{4})[\s\-]?([0-9]{3})[\s\-]?([0-9]{3})\b",
+    re.I,
+)
+APN_BARE_RE = re.compile(r"\b([0-9]{4})-([0-9]{3})-([0-9]{3})\b")
+TRANSFER_TAX_RE = re.compile(
+    r"(DOCUMENTARY\s+TRANSFER\s+TAX|CITY\s+TRANSFER\s+TAX|CITY\s+TAX)\s*[:$# ]*\s*(NONE|NO\s*TAX|[0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+    re.I,
+)
+COMPANY_NO_RE = re.compile(r"\b(?:COMPANY|REGISTRATION|ENTITY|FILE)\s+(?:NO|NUMBER|#)\.?\s*[:#]?\s*([A-Z0-9\-]{3,30})\b", re.I)
+OCR_CONFIDENCE_PREFIX_RE = re.compile(r"(?m)^\s*(?:0|1)(?:\.\d{1,3})?\s+")
+PHONE_LIKE_RE = re.compile(
+    r"(?<!\d)(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}(?!\d)"
+)
+EMAIL_LIKE_RE = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.I)
+DOC_DATE_LINE_RE = re.compile(
+    r"\b(?:DATED|DATE|EXECUTED|ACKNOWLEDGED|SUBSCRIBED|NOTARY|RECORDED|FILED)\b",
+    re.I,
+)
+DATE_VALUE_RE = re.compile(
+    r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|"
+    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?\s+\d{1,2},?\s+\d{2,4})\b",
+    re.I,
+)
+
+
+def now_utc() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clean_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def upper_blob(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").upper())
+
+
+def strip_ocr_confidence_prefixes(text: str) -> str:
+    """Apple Vision wrappers often prefix each OCR line with confidence like 1.00."""
+    return OCR_CONFIDENCE_PREFIX_RE.sub("", text or "")
+
+
+def split_jsonish(value: str) -> list[str]:
+    value = (value or "").strip()
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        values = parsed if isinstance(parsed, list) else [parsed]
+        flattened = []
+        for item in values:
+            if isinstance(item, str) and item.strip().startswith("["):
+                flattened.extend(split_jsonish(item))
+            else:
+                cleaned = clean_ws(str(item))
+                if cleaned:
+                    flattened.append(cleaned)
+        return flattened
+    except Exception:
+        pass
+    return [clean_ws(v) for v in re.split(r";|\|", value) if clean_ws(v)]
+
+
+def join_unique(values: Iterable[str]) -> str:
+    out = []
+    seen = set()
+    for value in values:
+        value = clean_ws(str(value))
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return json.dumps(out, ensure_ascii=False)
+
+
+def load_index(path: Path) -> dict[str, dict[str, str]]:
+    by_doc: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    if not path.exists():
+        return {}
+    with path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            doc = clean_ws(row.get("doc_no") or row.get("document_no") or "")
+            if not doc:
+                continue
+            for field in ["ain", "record_date", "county_type", "grantors", "grantees", "lead_class"]:
+                raw = row.get(field) or ""
+                if field in {"ain", "record_date", "county_type", "lead_class", "grantors", "grantees"}:
+                    for item in split_jsonish(raw):
+                        by_doc[doc][field].add(item)
+    return {
+        doc: {field: join_unique(sorted(values)) for field, values in fields.items()}
+        for doc, fields in by_doc.items()
+    }
+
+
+def group_pages(png_dir: Path) -> dict[str, list[Path]]:
+    pages: dict[str, list[tuple[int, Path]]] = defaultdict(list)
+    for path in png_dir.glob("**/*.png"):
+        match = re.match(r"(\d+)_p?(\d+)\.png$", path.name, re.I)
+        if not match:
+            continue
+        pages[match.group(1)].append((int(match.group(2)), path))
+    return {doc: [path for _, path in sorted(items)] for doc, items in pages.items()}
+
+
+OCR_QUALITY_TERMS = (
+    "GRANTOR", "GRANTEE", "GRANTS", "CORPORATION", "COMPANY", "LIMITED",
+    "HONG KONG", "JAPAN", "DUBAI", "UNITED ARAB", "APN", "PARCEL",
+    "RECORDING REQUESTED", "MAIL TAX", "TRANSFER TAX", "TRUST TRANSFER",
+)
+
+
+def ocr_quality_score(text: str) -> float:
+    upper = upper_blob(text or "")
+    words = re.findall(r"[A-Z]{3,}", upper)
+    score = min(len(words), 500) * 0.2
+    for term in OCR_QUALITY_TERMS:
+        if term in upper:
+            score += 20
+    # Penalize outputs dominated by OCR confetti.
+    if text:
+        alpha_ratio = sum(ch.isalpha() for ch in text) / max(len(text), 1)
+        score += alpha_ratio * 50
+    return score
+
+
+def preprocess_for_tesseract(path: Path) -> Path | None:
+    if Image is None or ImageOps is None:
+        return None
+    try:
+        image = Image.open(path).convert("RGB")
+    except Exception:
+        return None
+
+    # NETR preview pages carry a diagonal green watermark that can dominate
+    # Tesseract. Remove green-dominant pixels before upscaling.
+    pixels = image.load()
+    width, height = image.size
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y]
+            if g > 70 and g > r + 18 and g > b + 18:
+                pixels[x, y] = (255, 255, 255)
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+    scale = 3
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    gray = gray.resize((width * scale, height * scale), resample)
+    tmp = tempfile.NamedTemporaryFile(prefix="netr_ocr_", suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        gray.save(tmp_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return tmp_path
+
+
+def run_tesseract(tess: str, path: Path, psm: str, label: str) -> tuple[str, str, float]:
+    try:
+        proc = subprocess.run(
+            [
+                tess,
+                str(path),
+                "stdout",
+                "--oem",
+                "1",
+                "--psm",
+                psm,
+                "-c",
+                "preserve_interword_spaces=1",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        text = proc.stdout if proc.returncode == 0 else (proc.stdout or proc.stderr)
+        status = f"{label}_psm{psm}" if proc.returncode == 0 else f"{label}_psm{psm}_exit_{proc.returncode}"
+        return text, status, ocr_quality_score(text)
+    except Exception as exc:
+        return "", f"{label}_psm{psm}_error_{type(exc).__name__}", 0.0
+
+
+def ocr_one(path: Path, ocr_bin: str | None) -> tuple[str, str]:
+    if ocr_bin and Path(ocr_bin).exists():
+        try:
+            proc = subprocess.run([ocr_bin, str(path)], text=True, capture_output=True, timeout=120)
+            if proc.returncode == 0:
+                return proc.stdout, "ok_vision"
+            return proc.stdout or proc.stderr, f"vision_exit_{proc.returncode}"
+        except Exception as exc:
+            return "", f"vision_error_{type(exc).__name__}"
+
+    tess = shutil.which("tesseract")
+    if tess:
+        attempts: list[tuple[str, str, float]] = []
+        temp_paths: list[Path] = []
+        try:
+            candidates: list[tuple[Path, str, tuple[str, ...]]] = [(path, "orig", ("6", "4", "11"))]
+            preprocessed = preprocess_for_tesseract(path)
+            if preprocessed:
+                temp_paths.append(preprocessed)
+                candidates.append((preprocessed, "clean", ("6", "4", "11", "12")))
+            for candidate, label, psms in candidates:
+                for psm in psms:
+                    attempts.append(run_tesseract(tess, candidate, psm, label))
+        finally:
+            for tmp_path in temp_paths:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        ok_attempts = [attempt for attempt in attempts if attempt[0].strip()]
+        if ok_attempts:
+            chunks = []
+            seen = set()
+            for text, status, _score in sorted(ok_attempts, key=lambda item: item[2], reverse=True):
+                digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                chunks.append(f"\n--- OCR_ATTEMPT {status} ---\n{text}")
+            return "\n".join(chunks), f"ok_tesseract_multi_{len(chunks)}"
+        if attempts:
+            text, status, _score = attempts[0]
+            return text, status
+        return "", "tesseract_no_attempts"
+
+    return "", "ocr_engine_missing"
+
+
+def ocr_pages(paths: list[Path], ocr_bin: str | None) -> tuple[str, list[str]]:
+    chunks = []
+    statuses = []
+    for path in paths:
+        text, status = ocr_one(path, ocr_bin)
+        statuses.append(status)
+        chunks.append(f"\n\n--- PAGE {path.name} OCR_STATUS={status} ---\n{text}")
+    return "\n".join(chunks), statuses
+
+
+def extract_apns(text: str) -> list[str]:
+    found = []
+    for rx in (APN_RE, APN_BARE_RE):
+        for match in rx.finditer(text or ""):
+            found.append("%s-%s-%s" % (match.group(1), match.group(2), match.group(3)))
+    return list(dict.fromkeys(found))
+
+
+def canonical_jurisdiction(raw: str) -> tuple[str, str, bool]:
+    blob = upper_blob(raw)
+    for pattern, canonical, region in JURISDICTION_ALIASES:
+        if re.search(pattern, blob, re.I):
+            return canonical, region, True
+    blob = re.sub(r"[^A-Z ]", " ", blob)
+    blob = re.sub(r"\s+", " ", blob).strip()
+    if blob in US_STATES:
+        return blob.title(), "us", False
+    # Unknown free text is kept for manual review but must not inflate foreign
+    # counts. OCR can over-capture clause fragments such as "the following
+    # described real property ... SAR corporation".
+    return clean_ws(raw).title(), "unknown", False
+
+
+def extract_entity_domiciles(text: str) -> list[dict[str, str]]:
+    blob = upper_blob(text)
+    etype = r"(?:%s)" % "|".join(re.escape(t) for t in sorted(ENTITY_TYPES, key=len, reverse=True))
+    patterns = [
+        re.compile(
+            r"(?P<entity>[A-Z0-9][A-Z0-9 .,'&()/\\-]{2,120}?),?\s+"
+            r"(?:A|AN)\s+(?P<jurisdiction>[A-Z][A-Z .'-]{2,60}?)\s+"
+            r"(?P<entity_type>%s)\b" % etype,
+            re.I,
+        ),
+        re.compile(
+            r"(?P<entity>[A-Z0-9][A-Z0-9 .,'&()/\\-]{2,120}?)\s+"
+            r"(?P<entity_type>%s),?\s+(?:A|AN)\s+"
+            r"(?P<jurisdiction>[A-Z][A-Z .'-]{2,60}?)\s+(?:ENTITY|COMPANY|CORPORATION)\b" % etype,
+            re.I,
+        ),
+    ]
+    out = []
+    seen = set()
+    for rx in patterns:
+        for match in rx.finditer(blob):
+            entity = clean_ws(match.group("entity").strip(" ,.;:"))
+            jurisdiction_raw = clean_ws(match.group("jurisdiction").strip(" ,.;:"))
+            entity_type = clean_ws(match.group("entity_type").strip(" ,.;:"))
+            if len(entity) < 3 or len(jurisdiction_raw) < 2:
+                continue
+            canonical, region, is_foreign = canonical_jurisdiction(jurisdiction_raw)
+            phrase = clean_ws(match.group(0).strip(" ,.;:"))
+            key = (entity, canonical, entity_type, phrase)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "entity": entity,
+                "jurisdiction_raw": jurisdiction_raw,
+                "jurisdiction": canonical,
+                "region": region,
+                "is_foreign": str(bool(is_foreign)).lower(),
+                "entity_type": entity_type,
+                "phrase": phrase,
+            })
+    return out
+
+
+def extract_block(lines: list[str], starts: tuple[str, ...], max_lines: int = 12) -> str:
+    blocks = extract_blocks(lines, starts, max_lines=max_lines)
+    for block in blocks:
+        if country_from_block(block)[1]:
+            return block
+    return blocks[0] if blocks else ""
+
+
+def extract_blocks(lines: list[str], starts: tuple[str, ...], max_lines: int = 12) -> list[str]:
+    starts_upper = tuple(s.upper() for s in starts)
+    blocks = []
+    for i, line in enumerate(lines):
+        up = line.upper()
+        if any(s in up for s in starts_upper):
+            block = [line]
+            for nxt in lines[i + 1:i + 1 + max_lines]:
+                clean = nxt.strip()
+                if not clean:
+                    if len(block) > 1:
+                        break
+                    continue
+                if re.search(
+                    r"^(SPACE ABOVE|DOCUMENTARY|THIS CONVEYANCE|GRANTOR|GRANTEE|"
+                    r"EXHIBIT|LEGAL DESCRIPTION|WHEN RECORDED|MAIL TAX|RETURN TO|"
+                    r"PREPARED BY|TRUST TRANSFER|GRANT DEED|DEED OF TRUST|QUITCLAIM|"
+                    r"DATED|DATE|APN|A\.P\.N)\b",
+                    clean,
+                    re.I,
+                ):
+                    break
+                block.append(clean)
+            blocks.append(" | ".join(clean_ws(x) for x in block if clean_ws(x)))
+    return list(dict.fromkeys(blocks))
+
+
+def country_from_block(block: str) -> tuple[str, bool]:
+    if not block:
+        return "", False
+    hits = []
+    for pattern, canonical, _region in JURISDICTION_ALIASES:
+        if re.search(pattern, block, re.I):
+            hits.append(canonical)
+    if hits:
+        return hits[0], True
+    return "", False
+
+
+def extract_body_grantee(text: str) -> str:
+    match = re.search(
+        r"\bGRANTS?\s+TO:?\s*(?P<party>.{5,240}?)(?:\bTHE\s+FOLLOWING\b|\bTHE\s+REAL\b|\bREAL\s+PROPERTY\b|\bSITUATED\b)",
+        text,
+        re.I | re.S,
+    )
+    if not match:
+        return ""
+    return clean_ws(match.group("party")).strip(" ,.;:")
+
+
+def extract_transfer_taxes(text: str) -> tuple[str, str, str]:
+    values = []
+    estimates = []
+    for label, raw in TRANSFER_TAX_RE.findall(text or ""):
+        raw_clean = clean_ws(raw)
+        values.append(f"{clean_ws(label)}={raw_clean}")
+        number = re.sub(r"[^0-9.]", "", raw_clean)
+        if number:
+            try:
+                tax = float(number)
+            except ValueError:
+                continue
+            if tax > 0:
+                estimates.append(round(tax / 0.0011, 2))
+    confidence = "not_estimated"
+    if estimates:
+        confidence = "low_county_tax_rate_only_verify_city_exemptions"
+    return "; ".join(values), json.dumps(estimates), confidence
+
+
+def extract_company_numbers(text: str) -> list[str]:
+    return list(dict.fromkeys(clean_ws(m.group(1)) for m in COMPANY_NO_RE.finditer(text or "")))
+
+
+def redact_phone_like(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) < 7:
+        return "***"
+    return "***-***-" + digits[-4:]
+
+
+def redact_email_like(value: str) -> str:
+    value = value or ""
+    if "@" not in value:
+        return "***"
+    user, domain = value.split("@", 1)
+    return (user[:1] or "*") + "***@" + domain.lower()
+
+
+def redact_contact_line(line: str) -> str:
+    out = PHONE_LIKE_RE.sub(lambda m: redact_phone_like(m.group(0)), line or "")
+    out = EMAIL_LIKE_RE.sub(lambda m: redact_email_like(m.group(0)), out)
+    return clean_ws(out)
+
+
+def is_probable_non_contact_number(line: str, value: str) -> bool:
+    digits = re.sub(r"\D", "", value or "")
+    upper = upper_blob(line)
+    if len(digits) != 10:
+        return True
+    if re.search(r"\b(APN|AIN|PARCEL|DOCUMENT|INSTRUMENT|TAX)\b", upper):
+        return True
+    return False
+
+
+def extract_contact_like_signals(lines: list[str]) -> dict[str, object]:
+    phone_values = []
+    phone_contexts = []
+    email_values = []
+    email_contexts = []
+    for line in lines:
+        for match in PHONE_LIKE_RE.finditer(line):
+            raw = match.group(0)
+            if is_probable_non_contact_number(line, raw):
+                continue
+            phone_values.append(redact_phone_like(raw))
+            phone_contexts.append(redact_contact_line(line))
+        for match in EMAIL_LIKE_RE.finditer(line):
+            raw = match.group(0)
+            email_values.append(redact_email_like(raw))
+            email_contexts.append(redact_contact_line(line))
+    return {
+        "phone_like_count": len(list(dict.fromkeys(phone_values))),
+        "phone_like_values_redacted": list(dict.fromkeys(phone_values)),
+        "phone_like_contexts_redacted": list(dict.fromkeys(phone_contexts))[:10],
+        "email_like_count": len(list(dict.fromkeys(email_values))),
+        "email_like_values_redacted": list(dict.fromkeys(email_values)),
+        "email_like_contexts_redacted": list(dict.fromkeys(email_contexts))[:10],
+    }
+
+
+def extract_document_date_lines(lines: list[str]) -> list[str]:
+    hits = []
+    for line in lines:
+        if DOC_DATE_LINE_RE.search(line) and DATE_VALUE_RE.search(line):
+            hits.append(clean_ws(line))
+    return list(dict.fromkeys(hits))[:25]
+
+
+def extract_address_blocks(lines: list[str]) -> list[str]:
+    return extract_blocks(
+        lines,
+        (
+            "RECORDING REQUESTED BY",
+            "WHEN RECORDED MAIL TO",
+            "MAIL TAX STATEMENTS TO",
+            "MAIL TO",
+            "RETURN TO",
+            "PREPARED BY",
+            "SEND TAX STATEMENTS TO",
+        ),
+    )
+
+
+def extract_resource_terms(text: str) -> list[str]:
+    upper = upper_blob(text)
+    hits = []
+    for pattern, label in RESOURCE_PATTERNS:
+        if re.search(pattern, upper, re.I):
+            hits.append(label)
+    return list(dict.fromkeys(hits))
+
+
+def entity_suffix_flag(values: Iterable[str]) -> bool:
+    blob = upper_blob(" ".join(values))
+    return any(re.search(r"\b%s\b" % re.escape(t), blob) for t in ENTITY_TYPES)
+
+
+def analyze_text(doc: str, text: str, meta: dict[str, str], text_path: Path, statuses: list[str]) -> dict[str, str]:
+    analysis_text = strip_ocr_confidence_prefixes(text)
+    lines = [clean_ws(line) for line in analysis_text.splitlines() if clean_ws(line)]
+    text_sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    domiciles = extract_entity_domiciles(analysis_text)
+    foreign = [d for d in domiciles if d["is_foreign"] == "true"]
+    jurisdictions = [d["jurisdiction"] for d in foreign]
+    recording_block = extract_block(lines, ("RECORDING REQUESTED BY", "REQUESTED BY"))
+    mail_block = extract_block(lines, ("WHEN RECORDED MAIL TO", "MAIL TAX STATEMENTS TO", "MAIL TO"))
+    address_blocks = extract_address_blocks(lines)
+    mail_country, mail_foreign = country_from_block(mail_block)
+    apns = extract_apns(analysis_text)
+    body_grantee = extract_body_grantee(analysis_text)
+    taxes_raw, estimates_json, estimate_conf = extract_transfer_taxes(analysis_text)
+    company_numbers = extract_company_numbers(analysis_text)
+    contact_signals = extract_contact_like_signals(lines)
+    document_date_lines = extract_document_date_lines(lines)
+    upper = upper_blob(analysis_text)
+    mineral_hits = extract_resource_terms(analysis_text)
+    trust_signal = bool(re.search(r"\bTRUSTEE\b|\bTRUST\b|\bTRUSTOR\b|\bBENEFICIARY\b", upper))
+    corp_party = entity_suffix_flag(split_jsonish(meta.get("grantors", "")) + split_jsonish(meta.get("grantees", "")))
+    tags = []
+    if foreign:
+        tags.append("foreign_entity_domicile_clause")
+    if mail_foreign:
+        tags.append("international_mail_block")
+    if mineral_hits:
+        tags.append("mineral_or_resource_rights")
+    if corp_party:
+        tags.append("corporate_party_from_index")
+    if company_numbers:
+        tags.append("company_registration_number")
+    if trust_signal:
+        tags.append("trust_or_trustee_language")
+    if estimates_json != "[]":
+        tags.append("transfer_tax_price_proxy_low_confidence")
+    if contact_signals["phone_like_count"]:
+        tags.append("phone_like_text_present_not_contact_ready")
+    if contact_signals["email_like_count"]:
+        tags.append("email_like_text_present_not_contact_ready")
+    if document_date_lines:
+        tags.append("document_date_or_recording_stamp_text")
+    if any(s.startswith("ocr_engine_missing") for s in statuses):
+        tags.append("ocr_engine_missing")
+
+    return {
+        "doc_no": doc,
+        "index_ains": meta.get("ain", "[]"),
+        "index_record_dates": meta.get("record_date", "[]"),
+        "index_county_types": meta.get("county_type", "[]"),
+        "index_grantors": meta.get("grantors", "[]"),
+        "index_grantees": meta.get("grantees", "[]"),
+        "ocr_status": "ok" if any(s.startswith("ok_") for s in statuses) else (statuses[0] if statuses else "no_pages"),
+        "ocr_engines": join_unique(statuses),
+        "pages_ocrd": str(len(statuses)),
+        "ocr_text_path": str(text_path),
+        "ocr_text_sha256": text_sha,
+        "ocr_chars": str(len(text)),
+        "apns_all": join_unique(apns),
+        "recording_requested_by_raw": recording_block,
+        "mail_to_raw": mail_block,
+        "mail_to_country": mail_country,
+        "mail_to_international_flag": str(mail_foreign).lower(),
+        "address_blocks_raw": join_unique(address_blocks),
+        "body_grantee_raw": body_grantee,
+        "entity_domicile_phrases": json.dumps(domiciles, ensure_ascii=False),
+        "foreign_entity_jurisdictions": join_unique(jurisdictions),
+        "foreign_entity_flag": str(bool(foreign)).lower(),
+        "company_numbers": join_unique(company_numbers),
+        "document_date_lines_raw": join_unique(document_date_lines),
+        "transfer_tax_raw": taxes_raw,
+        "estimated_consideration_from_county_tax": estimates_json,
+        "consideration_confidence": estimate_conf,
+        "phone_like_count": str(contact_signals["phone_like_count"]),
+        "phone_like_values_redacted": json.dumps(contact_signals["phone_like_values_redacted"], ensure_ascii=False),
+        "phone_like_contexts_redacted": json.dumps(contact_signals["phone_like_contexts_redacted"], ensure_ascii=False),
+        "email_like_count": str(contact_signals["email_like_count"]),
+        "email_like_values_redacted": json.dumps(contact_signals["email_like_values_redacted"], ensure_ascii=False),
+        "email_like_contexts_redacted": json.dumps(contact_signals["email_like_contexts_redacted"], ensure_ascii=False),
+        "mineral_rights_signal": str(bool(mineral_hits)).lower(),
+        "mineral_terms": join_unique(mineral_hits),
+        "trustee_trust_signal": str(trust_signal).lower(),
+        "corporate_party_from_index_flag": str(corp_party).lower(),
+        "buyer_seller_intel_tags": join_unique(tags),
+    }
+
+
+FIELDS = [
+    "doc_no", "index_ains", "index_record_dates", "index_county_types",
+    "index_grantors", "index_grantees", "ocr_status", "ocr_engines",
+    "pages_ocrd", "ocr_text_path", "ocr_text_sha256", "ocr_chars", "apns_all",
+    "recording_requested_by_raw", "mail_to_raw", "mail_to_country",
+    "mail_to_international_flag", "address_blocks_raw", "body_grantee_raw", "entity_domicile_phrases",
+    "foreign_entity_jurisdictions", "foreign_entity_flag", "company_numbers",
+    "document_date_lines_raw",
+    "transfer_tax_raw", "estimated_consideration_from_county_tax",
+    "consideration_confidence", "phone_like_count", "phone_like_values_redacted",
+    "phone_like_contexts_redacted", "email_like_count", "email_like_values_redacted",
+    "email_like_contexts_redacted", "mineral_rights_signal", "mineral_terms",
+    "trustee_trust_signal", "corporate_party_from_index_flag",
+    "buyer_seller_intel_tags",
+]
+
+
+def run(png_dir: Path, index_csv: Path, out_dir: Path, ocr_bin: str | None) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text_dir = out_dir / "ocr_text"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    meta_by_doc = load_index(index_csv)
+    pages_by_doc = group_pages(png_dir)
+    rows = []
+    status_counts = Counter()
+    tag_counts = Counter()
+    for doc, paths in sorted(pages_by_doc.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]):
+        text, statuses = ocr_pages(paths, ocr_bin)
+        text_path = text_dir / f"{doc}.txt"
+        text_path.write_text(text, encoding="utf-8")
+        row = analyze_text(doc, text, meta_by_doc.get(doc, {}), text_path, statuses)
+        rows.append(row)
+        status_counts[row["ocr_status"]] += 1
+        for tag in json.loads(row["buyer_seller_intel_tags"]):
+            tag_counts[tag] += 1
+
+    csv_path = out_dir / "deed_body_intelligence.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "generated_at_utc": now_utc(),
+        "png_dir": str(png_dir),
+        "index_csv": str(index_csv),
+        "out_dir": str(out_dir),
+        "docs_with_pages": len(pages_by_doc),
+        "docs_ocrd": len(rows),
+        "foreign_entity_docs": sum(1 for r in rows if r["foreign_entity_flag"] == "true"),
+        "international_mail_docs": sum(1 for r in rows if r["mail_to_international_flag"] == "true"),
+        "mineral_signal_docs": sum(1 for r in rows if r["mineral_rights_signal"] == "true"),
+        "phone_like_signal_docs": sum(1 for r in rows if int(r.get("phone_like_count") or 0) > 0),
+        "email_like_signal_docs": sum(1 for r in rows if int(r.get("email_like_count") or 0) > 0),
+        "ocr_status_counts": dict(status_counts),
+        "tag_counts": dict(tag_counts),
+        "raw_contacts_exported": 0,
+        "outputs": {
+            "deed_body_intelligence_csv": str(csv_path),
+            "ocr_text_dir": str(text_dir),
+        },
+    }
+    (out_dir / "deed_body_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
+def self_test() -> int:
+    sample = """
+    RECORDING REQUESTED BY:
+    U.S. Petroleum Limited,
+    a Hong Kong SAR corporation
+    WHEN RECORDED MAIL TO
+    MOHAMMED RUSTAM
+    RM. 1905-08, 19th Floor
+    161 Connaught Road Central
+    Hong Kong SAR
+
+    TRUST TRANSFER GRANT DEED
+    Mohammed Rustam hereby GRANTS to:
+    U.S. Petroleum Limited, a Hong Kong SAR corporation, company number 968292,
+    the following described real property in Los Angeles County.
+    APN#2848-010-011, APN#2848-010-021, APN#2848-010-022 and APN#2848-011-001.
+    patented placer mining claims, mineral, oil and gas rights.
+    Documentary Transfer Tax $ None
+    Dated: APR 26, 2017
+    Prepared by Example Escrow (213) 555-0188 docs@example.com
+
+    Yahirushi Co, Ltd., a Japan Corporation accepts title.
+    Example UAE Buyer Ltd, a Dubai company, also appears.
+    France Holdings SARL, a France company, appears.
+    Peninsula UK Ltd, a Malta company, appears.
+    Gulf India Holdings, an India company, appears.
+    Nordic Buyer AB, a Sweden company, appears.
+    Muscat Capital LLC, an Oman company, appears.
+    """
+    row = analyze_text("20220482987", sample, {"grantees": json.dumps(["US PETROLEUM LIMITED"])}, Path("ocr_text/20220482987.txt"), ["ok_self_test"])
+    assert row["foreign_entity_flag"] == "true", row
+    assert "Hong Kong SAR" in row["foreign_entity_jurisdictions"], row
+    assert "Japan" in row["foreign_entity_jurisdictions"], row
+    assert "United Arab Emirates" in row["foreign_entity_jurisdictions"], row
+    assert "France" in row["foreign_entity_jurisdictions"], row
+    assert "Malta" in row["foreign_entity_jurisdictions"], row
+    assert "India" in row["foreign_entity_jurisdictions"], row
+    assert "Sweden" in row["foreign_entity_jurisdictions"], row
+    assert "Oman" in row["foreign_entity_jurisdictions"], row
+    assert row["mail_to_international_flag"] == "true", row
+    assert row["mineral_rights_signal"] == "true", row
+    assert "2848-010-011" in row["apns_all"], row
+    assert row["phone_like_count"] == "1", row
+    assert row["email_like_count"] == "1", row
+    assert "document_date_or_recording_stamp_text" in row["buyer_seller_intel_tags"], row
+    noise = analyze_text(
+        "20260000000",
+        "NOTICE OF DEFAULT AND ELECTION TO SELL UNDER DEED OF TRUST Claim of Lien gas service account",
+        {},
+        Path("ocr_text/20260000000.txt"),
+        ["ok_self_test"],
+    )
+    assert noise["mineral_rights_signal"] == "false", noise
+    print("self_test_ok")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("png_dir", nargs="?")
+    parser.add_argument("index_csv", nargs="?")
+    parser.add_argument("out_dir", nargs="?")
+    parser.add_argument("--ocr-bin", default=os.environ.get("OCR_BIN", "/tmp/ocr"))
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.png_dir or not args.index_csv or not args.out_dir:
+        parser.error("png_dir, index_csv, and out_dir are required unless --self-test is used")
+    return run(Path(args.png_dir), Path(args.index_csv), Path(args.out_dir), args.ocr_bin)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
