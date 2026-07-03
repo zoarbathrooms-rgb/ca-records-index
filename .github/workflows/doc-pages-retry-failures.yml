@@ -1,0 +1,190 @@
+name: doc-pages-retry-failures
+# Backfill documents whose prior page pull had failed pages or hit max_pages.
+on:
+  workflow_dispatch:
+    inputs:
+      source_page_run_id: { required: true, type: string }
+      pages: { required: false, type: string, default: "25" }
+      shards: { required: false, type: string, default: "4" }
+      delay_min: { required: false, type: string, default: "5.0" }
+      delay_max: { required: false, type: string, default: "7.0" }
+      attempts: { required: false, type: string, default: "6" }
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      doc_count: ${{ steps.gen.outputs.doc_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: download prior page artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts doclists
+          gh run download "${{ inputs.source_page_run_id }}" -R "${{ github.repository }}" -D artifacts
+      - id: gen
+        run: |
+          python3 - "${{ inputs.shards }}" <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, glob, json, sys
+          complete = {"done", "no_pages"}
+          shards = max(1, int(sys.argv[1]))
+          docs = []
+          seen = set()
+          meta = {}
+          def add_meta(doc, row):
+              rec = meta.setdefault(doc, {
+                  "doc_no": doc, "ain": set(), "record_date": set(),
+                  "county_type": set(), "grantors": set(), "grantees": set(),
+                  "lead_class": set(),
+              })
+              for key in ("ain", "record_date", "county_type", "lead_class"):
+                  val = (row.get(key) or "").strip()
+                  if val:
+                      rec[key].add(val)
+              for key in ("grantors", "grantees"):
+                  raw = (row.get(key) or "").strip()
+                  if not raw:
+                      continue
+                  try:
+                      parsed = json.loads(raw)
+                      vals = parsed if isinstance(parsed, list) else [raw]
+                  except Exception:
+                      vals = [v.strip() for v in raw.replace("|", ";").split(";")]
+                  for val in vals:
+                      val = str(val).strip()
+                      if val:
+                          rec[key].add(val)
+          for path in sorted(glob.glob("artifacts/**/failed_pages.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      doc = (row.get("doc_no") or "").strip()
+                      if doc and doc not in seen:
+                          seen.add(doc)
+                          docs.append(doc)
+          for path in sorted(glob.glob("artifacts/**/doc_status.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      doc = (row.get("doc_no") or "").strip()
+                      status = (row.get("status") or "").strip()
+                      if doc and status not in complete and doc not in seen:
+                          seen.add(doc)
+                          docs.append(doc)
+          wanted = set(docs)
+          for path in sorted(glob.glob("artifacts/**/doc_metadata.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      doc = (row.get("doc_no") or "").strip()
+                      if doc in wanted:
+                          add_meta(doc, row)
+          docs = sorted(docs, key=lambda d: int(d) if d.isdigit() else d)
+          with open("doclists/doc_metadata.csv", "w", newline="", encoding="utf-8") as fh:
+              writer = csv.DictWriter(fh, fieldnames=["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"])
+              writer.writeheader()
+              for doc in docs:
+                  rec = meta.get(doc, {"doc_no": doc})
+                  out = {"doc_no": doc}
+                  for key in ("ain", "record_date", "county_type", "grantors", "grantees", "lead_class"):
+                      out[key] = json.dumps(sorted(rec.get(key, set())))
+                  writer.writerow(out)
+          per = -(-len(docs) // shards) if docs else 1
+          include = []
+          for i in range(shards):
+              chunk = docs[i * per:(i + 1) * per]
+              if not chunk:
+                  continue
+              path = f"doclists/retry_doclist_{i}.txt"
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write("\n".join(chunk) + "\n")
+              include.append({"i": i, "count": len(chunk)})
+          print("matrix=" + json.dumps({"include": include}))
+          print("doc_count=" + str(len(docs)))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retry-doc-page-lists-${{ inputs.source_page_run_id }}
+          path: doclists/
+          retention-days: 30
+
+  pull:
+    needs: plan
+    if: ${{ needs.plan.outputs.doc_count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install OCR engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+          python3 -m pip install --quiet pillow
+      - uses: actions/download-artifact@v4
+        with:
+          name: retry-doc-page-lists-${{ inputs.source_page_run_id }}
+          path: doclists
+      - name: download prior page artifacts for resume seed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p prior_artifacts
+          gh run download "${{ inputs.source_page_run_id }}" -R "${{ github.repository }}" -D prior_artifacts
+      - name: seed already fetched pages for shard ${{ matrix.i }}
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, shutil
+          docs = {
+              line.strip()
+              for line in Path("doclists/retry_doclist_${{ matrix.i }}.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          }
+          copied = 0
+          seen = set()
+          for path in Path("prior_artifacts").rglob("*.png"):
+              match = re.match(r"(\d+)_p?(\d+)\.png$", path.name, re.I)
+              if not match or match.group(1) not in docs:
+                  continue
+              dest = Path("out") / path.name
+              if dest in seen or dest.exists():
+                  continue
+              shutil.copy2(path, dest)
+              seen.add(dest)
+              copied += 1
+          print(f"seeded_existing_pages={copied}")
+          PY
+      - name: pull retry pages for shard ${{ matrix.i }}
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+        run: |
+          test -n "$NETR_PROXY_KEY"
+          python3 pull_docs.py "doclists/retry_doclist_${{ matrix.i }}.txt" out \
+            --max-pages "${{ inputs.pages }}" \
+            --attempts "${{ inputs.attempts }}" \
+            --delay-min "${{ inputs.delay_min }}" \
+            --delay-max "${{ inputs.delay_max }}"
+      - name: extract deed-body buyer/seller intelligence
+        if: always()
+        run: |
+          mkdir -p out/deed_intel
+          python3 deed_body_intelligence.py out doclists/doc_metadata.csv out/deed_intel
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doc-pages-retry-${{ inputs.source_page_run_id }}-${{ matrix.i }}
+          path: out/
+          retention-days: 30
+      - name: fail visibly if retry pages are still missing or capped
+        if: always()
+        run: python3 check_doc_pages_complete.py out
+      - name: fail visibly if deed OCR/intelligence is blank
+        if: always()
+        run: python3 check_deed_intelligence_complete.py out/deed_intel
